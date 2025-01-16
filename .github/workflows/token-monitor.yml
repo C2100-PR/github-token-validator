@@ -1,0 +1,114 @@
+name: Token Validation & Monitoring
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # Run every 30 minutes
+  workflow_dispatch:  # Manual trigger
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Monitoring Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+      
+      - name: Validate Token
+        id: validation
+        run: |
+          chmod +x ./scripts/validate_token.sh
+          ./scripts/validate_token.sh ${{ secrets.GITHUB_TOKEN }} ${{ github.repository_owner }} ${{ github.repository }}
+        continue-on-error: true
+      
+      - name: Check Rate Limits
+        id: rate_limits
+        run: |
+          RATE_LIMITS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/rate_limit)
+          CORE_REMAINING=$(echo $RATE_LIMITS | jq .resources.core.remaining)
+          CORE_LIMIT=$(echo $RATE_LIMITS | jq .resources.core.limit)
+          USAGE_PERCENT=$(( 100 - (CORE_REMAINING * 100 / CORE_LIMIT) ))
+          echo "::set-output name=usage_percent::$USAGE_PERCENT"
+          echo "API Usage: $USAGE_PERCENT%"
+      
+      - name: Alert on High Usage
+        if: steps.rate_limits.outputs.usage_percent > 80
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '⚠️ High API Usage Alert',
+              body: `API usage is at ${process.env.USAGE_PERCENT}%\nPlease review token usage patterns.`,
+              labels: ['alert', 'high-priority']
+            })
+
+      - name: Monitor Token Permissions
+        run: |
+          SCOPES=$(curl -s -I -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com | grep -i "x-oauth-scopes:")
+          echo "Current token scopes: $SCOPES"
+          
+          # Check for required scopes
+          if [[ ! $SCOPES =~ "repo" ]]; then
+            echo "::warning::Token missing repo scope"
+          fi
+          if [[ ! $SCOPES =~ "workflow" ]]; then
+            echo "::warning::Token missing workflow scope"
+          fi
+      
+      - name: Test Repository Access
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }})
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Repository access failed with status $STATUS"
+            exit 1
+          fi
+      
+      - name: Generate Report
+        if: always()
+        run: |
+          {
+            echo "# Token Validation Report"
+            echo "## Status Checks"
+            echo "- Validation: ${{ steps.validation.outcome }}"
+            echo "- Rate Limit Usage: ${{ steps.rate_limits.outputs.usage_percent }}%"
+            echo "- Repository Access: ${{ job.status }}"
+            echo
+            echo "## Timestamp"
+            echo "$(date -u)"
+          } > report.md
+      
+      - name: Upload Report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: validation-report
+          path: report.md
+
+  notify:
+    needs: validate
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create Issue on Failure
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🚨 Token Validation Failed',
+              body: 'The token validation workflow has failed. Please check the workflow logs for details.',
+              labels: ['alert', 'high-priority']
+            })
